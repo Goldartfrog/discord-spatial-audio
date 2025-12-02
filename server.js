@@ -1,10 +1,26 @@
 const WebSocket = require("ws");
+const http = require("http");
+const fs = require("fs");
+const path = require("path");
 
 const PORT = process.env.PORT || 34197;
-const wss = new WebSocket.Server({ 
-    port: PORT,
-    host: '216.15.14.234'
+const HTML_FILE = path.join(__dirname, "canvas.html");
+
+// Create HTTP server to serve canvas.html
+const server = http.createServer((req, res) => {
+    fs.readFile(HTML_FILE, (err, data) => {
+        if (err) {
+            res.writeHead(500, { "Content-Type": "text/plain" });
+            res.end("Error loading canvas.html");
+            return;
+        }
+        res.writeHead(200, { "Content-Type": "text/html" });
+        res.end(data);
+    });
 });
+
+// Attach WebSocket to the HTTP server
+const wss = new WebSocket.Server({ server });
 
 // Store positions per channel: { channelId: { visibleId: { visibleId, odId?, x, y } } }
 const channelPositions = {};
@@ -17,8 +33,6 @@ const wsToUser = new Map();
 
 // All connected clients with their channel
 const clients = new Map(); // ws -> { visibleId, channelId }
-
-console.log(`[SpatialVoice Server] Running on ws://localhost:${PORT}`);
 
 function getChannelPositions(channelId) {
     if (!channelPositions[channelId]) {
@@ -49,14 +63,38 @@ wss.on("connection", (ws) => {
                 // Plugin registering with Discord ID, username, and channel
                 const { odId, visibleId, channelId } = message;
                 
+                // Check if this user was already in a different channel (like "lobby")
+                const oldInfo = userInfo[visibleId];
+                if (oldInfo && oldInfo.channelId !== channelId) {
+                    // Move their position from old channel to new channel
+                    const oldPositions = getChannelPositions(oldInfo.channelId);
+                    const newPositions = getChannelPositions(channelId);
+                    
+                    if (oldPositions[visibleId]) {
+                        newPositions[visibleId] = oldPositions[visibleId];
+                        newPositions[visibleId].odId = odId;
+                        delete oldPositions[visibleId];
+                        
+                        // Broadcast to old channel that user left
+                        broadcastToChannel(oldInfo.channelId);
+                    }
+                }
+                
                 // Store user info
                 userInfo[visibleId] = { odId, channelId };
                 wsToUser.set(ws, visibleId);
                 clients.set(ws, { visibleId, channelId });
                 
+                // Also update any other WebSocket connections for this user (canvas)
+                for (const [clientWs, clientInfo] of clients) {
+                    if (clientInfo.visibleId === visibleId && clientWs !== ws) {
+                        clients.set(clientWs, { visibleId, channelId });
+                    }
+                }
+                
                 console.log(`[Server] Registered: ${visibleId} (${odId}) in channel ${channelId}`);
                 
-                // If we already have a position for this user, update it with odId and move to correct channel
+                // Update position with odId if it exists
                 const positions = getChannelPositions(channelId);
                 if (positions[visibleId]) {
                     positions[visibleId].odId = odId;
@@ -65,26 +103,33 @@ wss.on("connection", (ws) => {
                 // Send current positions in this channel to the new client
                 ws.send(JSON.stringify({ type: "positions", positions }));
                 
-                // Broadcast to others in this channel
+                // Broadcast to everyone in this channel
                 broadcastToChannel(channelId);
             }
             else if (message.type === "updatePosition") {
                 const { visibleId, x, y } = message;
                 
-                // Find which channel this user is in
+                // Find which channel this user should be in
                 let channelId = userInfo[visibleId]?.channelId;
                 
-                // If not registered yet via plugin, check if they're in clients map
+                // If not registered yet via plugin, check existing client info
                 const existingInfo = clients.get(ws);
-                if (!channelId && existingInfo) {
+                if (existingInfo && existingInfo.channelId && existingInfo.channelId !== "lobby") {
                     channelId = existingInfo.channelId;
                 }
                 
-                // If still no channel, they need to be in the same channel as someone with that username
+                // If still no channel, use lobby (will be moved when plugin registers)
                 if (!channelId) {
-                    // Default to a "lobby" channel for canvas-only users
-                    // They'll be matched when a plugin user with same username registers
                     channelId = "lobby";
+                }
+                
+                // If user was in lobby but now has a real channel, move them
+                if (existingInfo && existingInfo.channelId === "lobby" && channelId !== "lobby") {
+                    const lobbyPositions = getChannelPositions("lobby");
+                    if (lobbyPositions[visibleId]) {
+                        delete lobbyPositions[visibleId];
+                        broadcastToChannel("lobby");
+                    }
                 }
                 
                 wsToUser.set(ws, visibleId);
@@ -100,8 +145,6 @@ wss.on("connection", (ws) => {
                     x,
                     y
                 };
-
-                console.log(`[Server] ${visibleId} in ${channelId} -> (${Math.round(x)}, ${Math.round(y)})`);
 
                 broadcastToChannel(channelId);
             }
@@ -133,4 +176,9 @@ wss.on("connection", (ws) => {
     });
 });
 
-console.log(`[Server] Ready`);
+// Start the HTTP + WebSocket server
+server.listen(PORT, "0.0.0.0", () => {
+    console.log(`[SpatialVoice Server] Running on:`);
+    console.log(`  http://localhost:${PORT}`);
+    console.log(`  ws://localhost:${PORT}`);
+});
