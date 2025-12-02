@@ -1,88 +1,109 @@
-const http = require('http');
-const fs = require('fs');
-const path = require('path');
 const WebSocket = require("ws");
 
-// Use the testing port 34197 (can still be overridden by env if needed)
-const PORT = process.env.PORT || 34197;
-const HOST = '0.0.0.0';
-const HTML_FILE = path.join(__dirname, 'canvas.html');
-
-// Store positions: odId -> { odId, odname, x, y }
-const positions = {};
-
-// Track which ws belongs to which odId
-const wsToUser = new Map();
-
-// All connected clients
-const clients = new Set();
-
-// Get local IP for display
-const os = require('os');
-const networkInterfaces = os.networkInterfaces();
-let localIP = 'localhost';
-
-// Find the first non-internal IPv4 address
-for (const interfaceName of Object.keys(networkInterfaces)) {
-    for (const iface of networkInterfaces[interfaceName]) {
-        if (iface.family === 'IPv4' && !iface.internal) {
-            localIP = iface.address;
-            break;
-        }
-    }
-    if (localIP !== 'localhost') break;
-}
-
-// Basic HTTP server to serve canvas.html on the same port as WebSocket
-const server = http.createServer((req, res) => {
-    fs.readFile(HTML_FILE, (err, data) => {
-        if (err) {
-            res.writeHead(500, { 'Content-Type': 'text/plain' });
-            res.end('Error loading canvas.html');
-            return;
-        }
-
-        res.writeHead(200, { 'Content-Type': 'text/html' });
-        res.end(data);
-    });
+const PORT = process.env.PORT || 8080;
+const wss = new WebSocket.Server({ 
+    port: PORT,
+    host: '0.0.0.0'
 });
 
-// Attach WebSocket server to the same HTTP server (same port)
-const wss = new WebSocket.Server({ server });
+// Store positions per channel: { channelId: { visibleId: { visibleId, odId?, x, y } } }
+const channelPositions = {};
+
+// Map visibleId -> { odId, channelId } (when plugin registers)
+const userInfo = {};
+
+// Track ws -> visibleId
+const wsToUser = new Map();
+
+// All connected clients with their channel
+const clients = new Map(); // ws -> { visibleId, channelId }
+
+console.log(`[SpatialVoice Server] Running on ws://localhost:${PORT}`);
+
+function getChannelPositions(channelId) {
+    if (!channelPositions[channelId]) {
+        channelPositions[channelId] = {};
+    }
+    return channelPositions[channelId];
+}
+
+function broadcastToChannel(channelId) {
+    const positions = getChannelPositions(channelId);
+    const message = JSON.stringify({ type: "positions", positions });
+    
+    for (const [ws, info] of clients) {
+        if (info.channelId === channelId && ws.readyState === WebSocket.OPEN) {
+            ws.send(message);
+        }
+    }
+}
 
 wss.on("connection", (ws) => {
-    clients.add(ws);
-    console.log(`[Server] Client connected (${clients.size} total)`);
-
-    // Send current positions to new client
-    ws.send(JSON.stringify({
-        type: "positions",
-        positions: positions
-    }));
+    console.log(`[Server] Client connected`);
 
     ws.on("message", (data) => {
         try {
             const message = JSON.parse(data.toString());
 
-            if (message.type === "updatePosition") {
-                // Track which user this ws belongs to
-                wsToUser.set(ws, message.odId);
+            if (message.type === "register") {
+                // Plugin registering with Discord ID, username, and channel
+                const { odId, visibleId, channelId } = message;
                 
-                // Store new position
-                positions[message.odId] = {
-                    odId: message.odId,
-                    odname: message.odname,
-                    x: message.x,
-                    y: message.y
+                // Store user info
+                userInfo[visibleId] = { odId, channelId };
+                wsToUser.set(ws, visibleId);
+                clients.set(ws, { visibleId, channelId });
+                
+                console.log(`[Server] Registered: ${visibleId} (${odId}) in channel ${channelId}`);
+                
+                // If we already have a position for this user, update it with odId and move to correct channel
+                const positions = getChannelPositions(channelId);
+                if (positions[visibleId]) {
+                    positions[visibleId].odId = odId;
+                }
+                
+                // Send current positions in this channel to the new client
+                ws.send(JSON.stringify({ type: "positions", positions }));
+                
+                // Broadcast to others in this channel
+                broadcastToChannel(channelId);
+            }
+            else if (message.type === "updatePosition") {
+                const { visibleId, x, y } = message;
+                
+                // Find which channel this user is in
+                let channelId = userInfo[visibleId]?.channelId;
+                
+                // If not registered yet via plugin, check if they're in clients map
+                const existingInfo = clients.get(ws);
+                if (!channelId && existingInfo) {
+                    channelId = existingInfo.channelId;
+                }
+                
+                // If still no channel, they need to be in the same channel as someone with that username
+                if (!channelId) {
+                    // Default to a "lobby" channel for canvas-only users
+                    // They'll be matched when a plugin user with same username registers
+                    channelId = "lobby";
+                }
+                
+                wsToUser.set(ws, visibleId);
+                clients.set(ws, { visibleId, channelId });
+                
+                // Get or create positions for this channel
+                const positions = getChannelPositions(channelId);
+                
+                // Store position
+                positions[visibleId] = {
+                    visibleId,
+                    odId: userInfo[visibleId]?.odId || null,
+                    x,
+                    y
                 };
 
-                console.log(`[Server] ${message.odname} -> (${message.x}, ${message.y})`);
+                console.log(`[Server] ${visibleId} in ${channelId} -> (${Math.round(x)}, ${Math.round(y)})`);
 
-                // Broadcast to ALL clients
-                broadcast({
-                    type: "positions",
-                    positions: positions
-                });
+                broadcastToChannel(channelId);
             }
         } catch (e) {
             console.error("[Server] Bad message:", e);
@@ -90,40 +111,26 @@ wss.on("connection", (ws) => {
     });
 
     ws.on("close", () => {
-        clients.delete(ws);
+        const visibleId = wsToUser.get(ws);
+        const info = clients.get(ws);
         
-        // Remove user's position
-        const odId = wsToUser.get(ws);
-        if (odId) {
-            delete positions[odId];
-            wsToUser.delete(ws);
-            console.log(`[Server] ${odId} disconnected (${clients.size} total)`);
+        if (visibleId && info) {
+            const channelId = info.channelId;
+            const positions = getChannelPositions(channelId);
             
-            // Broadcast updated positions
-            broadcast({
-                type: "positions",
-                positions: positions
-            });
+            delete positions[visibleId];
+            delete userInfo[visibleId];
+            wsToUser.delete(ws);
+            clients.delete(ws);
+            
+            console.log(`[Server] ${visibleId} disconnected from ${channelId}`);
+            
+            broadcastToChannel(channelId);
         } else {
-            console.log(`[Server] Client disconnected (${clients.size} total)`);
+            clients.delete(ws);
+            console.log(`[Server] Client disconnected`);
         }
     });
 });
 
-function broadcast(message) {
-    const data = JSON.stringify(message);
-    for (const client of clients) {
-        if (client.readyState === WebSocket.OPEN) {
-            client.send(data);
-        }
-    }
-}
-
-// Start the HTTP + WebSocket server
-server.listen(PORT, HOST, () => {
-    console.log(`[SpatialVoice Server] HTTP + WS running on:`);
-    console.log(`  http://localhost:${PORT}`);
-    console.log(`  http://${localIP}:${PORT}`);
-    console.log(`  ws://localhost:${PORT}`);
-    console.log(`  ws://${localIP}:${PORT}`);
-});
+console.log(`[Server] Ready`);

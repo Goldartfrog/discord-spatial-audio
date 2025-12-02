@@ -59,6 +59,7 @@
             background: #2f2f2f;
             color: #fff;
             font-size: 14px;
+            width: 200px;
         }
 
         button {
@@ -116,18 +117,23 @@
     <div class="status">
         <div class="status-dot" id="statusDot"></div>
         <span id="statusText">Disconnected</span>
+        <span id="channelInfo"></span>
     </div>
 
     <div class="setup">
-        <input type="text" id="username" placeholder="Your name" value="">
-        <input type="text" id="odId" placeholder="Discord User ID">
+        <input type="text" id="username" placeholder="Discord username (e.g. goldartfrog)">
         <button id="connectBtn">Connect</button>
     </div>
+
+    <p class="hint" style="color: #666; font-size: 12px; margin-bottom: 20px;">
+        Make sure you've joined a Discord voice channel with the plugin enabled first!
+    </p>
 
     <canvas id="canvas" width="600" height="600"></canvas>
 
     <div class="instructions">
-        <p>Drag your circle to move. Others will hear you based on distance.</p>
+        <p>Enter your Discord username, then drag your circle to move.</p>
+        <p>Others will hear you based on distance!</p>
         <div class="legend">
             <div class="legend-item">
                 <div class="legend-dot" style="background: #5865f2;"></div>
@@ -151,38 +157,36 @@
         const statusDot = document.getElementById('statusDot');
         const statusText = document.getElementById('statusText');
         const usernameInput = document.getElementById('username');
-        const userIdInput = document.getElementById('odId');
 
         const CANVAS_SIZE = 600;
         const USER_RADIUS = 25;
         const MAX_DISTANCE = 300;
 
+        // Server URL - change this to your server
+        const SERVER_URL = 'ws://216.15.14.234:34197';
+
         let ws = null;
         let positions = {};
-        let myId = null;
+        let myVisibleId = null;
         let myPos = { x: CANVAS_SIZE / 2, y: CANVAS_SIZE / 2 };
         let isDragging = false;
 
         // Connect to WebSocket server
         function connect() {
-            const username = usernameInput.value.trim() || 'Anonymous';
-            const odId = userIdInput.value.trim();
+            const username = usernameInput.value.trim();
 
-            if (!odId) {
-                alert('Please enter your Discord User ID');
+            if (!username) {
+                alert('Please enter your Discord username');
                 return;
             }
 
-            myId = odId;
+            myVisibleId = username;
 
             if (ws) {
                 ws.close();
             }
 
-            // Use the testing server at 216.15.14.234:34197
-            const serverUrl = 'ws://216.15.14.234:34197';
-
-            ws = new WebSocket(serverUrl);
+            ws = new WebSocket(SERVER_URL);
 
             ws.onopen = () => {
                 statusDot.classList.add('connected');
@@ -232,8 +236,7 @@
             if (ws && ws.readyState === WebSocket.OPEN) {
                 ws.send(JSON.stringify({
                     type: 'updatePosition',
-                    odId: myId,
-                    odname: usernameInput.value.trim() || 'Anonymous',
+                    visibleId: myVisibleId,
                     x: myPos.x,
                     y: myPos.y
                 }));
@@ -276,8 +279,12 @@
             ctx.setLineDash([]);
 
             // Draw other users
-            for (const [odId, pos] of Object.entries(positions)) {
-                if (odId === myId) continue;
+            for (const [visibleId, pos] of Object.entries(positions)) {
+                if (visibleId === myVisibleId) {
+                    // Update my position from server (in case it changed)
+                    myPos = { x: pos.x, y: pos.y };
+                    continue;
+                }
 
                 const distance = getDistance(myPos, pos);
                 const ratio = Math.min(distance / MAX_DISTANCE, 1);
@@ -300,7 +307,7 @@
                 ctx.fillStyle = '#fff';
                 ctx.font = '14px sans-serif';
                 ctx.textAlign = 'center';
-                ctx.fillText(pos.odname || 'Unknown', pos.x, pos.y + USER_RADIUS + 18);
+                ctx.fillText(visibleId, pos.x, pos.y + USER_RADIUS + 18);
 
                 // Volume percentage
                 const volume = Math.round(100 - (ratio * 100));
@@ -322,7 +329,7 @@
             ctx.fillStyle = '#fff';
             ctx.font = 'bold 14px sans-serif';
             ctx.textAlign = 'center';
-            ctx.fillText('You', myPos.x, myPos.y + USER_RADIUS + 18);
+            ctx.fillText(myVisibleId || 'You', myPos.x, myPos.y + USER_RADIUS + 18);
         }
 
         // Mouse handling
@@ -358,6 +365,40 @@
         });
 
         canvas.addEventListener('mouseleave', () => {
+            isDragging = false;
+        });
+
+        // Touch handling for mobile
+        canvas.addEventListener('touchstart', (e) => {
+            e.preventDefault();
+            const rect = canvas.getBoundingClientRect();
+            const touch = e.touches[0];
+            const x = touch.clientX - rect.left;
+            const y = touch.clientY - rect.top;
+
+            if (getDistance({ x, y }, myPos) <= USER_RADIUS) {
+                isDragging = true;
+            }
+        });
+
+        canvas.addEventListener('touchmove', (e) => {
+            if (!isDragging) return;
+            e.preventDefault();
+
+            const rect = canvas.getBoundingClientRect();
+            const touch = e.touches[0];
+            let x = touch.clientX - rect.left;
+            let y = touch.clientY - rect.top;
+
+            x = Math.max(USER_RADIUS, Math.min(CANVAS_SIZE - USER_RADIUS, x));
+            y = Math.max(USER_RADIUS, Math.min(CANVAS_SIZE - USER_RADIUS, y));
+
+            myPos = { x, y };
+            sendPosition();
+            draw();
+        });
+
+        canvas.addEventListener('touchend', () => {
             isDragging = false;
         });
 
