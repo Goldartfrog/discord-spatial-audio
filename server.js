@@ -1,9 +1,9 @@
 const WebSocket = require("ws");
 
-const PORT = process.env.PORT || 8080;
+const PORT = process.env.PORT || 34197;
 const wss = new WebSocket.Server({ 
     port: PORT,
-    host: '0.0.0.0'
+    host: '216.15.14.234'
 });
 
 // Store positions per channel: { channelId: { visibleId: { visibleId, odId?, x, y } } }
